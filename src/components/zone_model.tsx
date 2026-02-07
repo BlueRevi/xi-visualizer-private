@@ -27,7 +27,7 @@ import { ZoneRayTestingBox } from "./zone_ray_testing_box";
 import PathNodes from "./path_nodes";
 import SelectionBox, { type SelectionBoxResult } from "./selection_box";
 import EntityPaths, { type EntityPathMap } from "./entity_paths";
-
+import { SpawnAutoload } from "../overlay/spawnAutoload";
 
 // Add the extension functions
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
@@ -727,7 +727,13 @@ export default function ZoneModel(props: ZoneDataProps) {
       }
     }
   });
-
+// Reload spawn markers when the selected zone changes
+createEffect(() => {
+  const z = getSelectedZone();
+  if (spawnAuto && z !== undefined) {
+    spawnAuto.load(z);
+  }
+});
   // Show/hide discrete entity meshes
   createEffect(() => {
     for (const entityKey in entitySettings) {
@@ -743,6 +749,7 @@ export default function ZoneModel(props: ZoneDataProps) {
   let canvasElement: HTMLCanvasElement;
   let labelRendererElement: HTMLDivElement;
   let coordLabelRef: HTMLDivElement;
+  let spawnAuto: SpawnAutoload | undefined;
 
   let hasMouseMovedSinceLast = false;
 
@@ -860,22 +867,55 @@ export default function ZoneModel(props: ZoneDataProps) {
     setControls(addMapControls(camera(), canvasElement));
 
     const renderer = new THREE.WebGLRenderer({ canvas: canvasElement, antialias: true, alpha: true });
-    setRenderer(renderer)
-    const labelRenderer = new CSS2DRenderer({ element: labelRendererElement });
+    // --- DEBUG EXPORT: expose camera & renderer (read-only) ---
+Object.defineProperties(globalThis as any, {
+  camera:   { value: camera(),   writable: false },  // camera() returns the actual THREE.PerspectiveCamera
+  renderer: { value: renderer,   writable: false },
+});
 
-    renderer.setAnimationLoop(() => animate(renderer, labelRenderer));
+// Optional: if scene wasn't exported in setupBaseScene(), you can safely export it here too:
+if (!(globalThis as any).scene) {
+  Object.defineProperty(globalThis as any, "scene", {
+    value: scene(),  // scene() returns the THREE.Scene
+    writable: false,
   });
+}
 
-  onCleanup(() => {
-    window.removeEventListener("resize", resizeCanvas);
-    cleanupNode(scene());
-    if (controls()) {
-      controls().dispose();
-      setControls(undefined);
-    }
-    scene().clear();
-    camera().clear();
-  });
+console.log("[xi-visualizer] Exposed camera & renderer (and scene if missing)");
+setRenderer(renderer)
+
+// --- Spawn autoload: build markers for the initial zone ---
+spawnAuto = new SpawnAutoload({
+  scene: scene(),
+  camera: camera(),
+  renderer: renderer,
+});
+spawnAuto.load(getSelectedZone());   // <-- no await needed
+
+const labelRenderer = new CSS2DRenderer({ element: labelRendererElement });
+renderer.setAnimationLoop(() => animate(renderer, labelRenderer));
+}); // <-- CLOSES onMount HERE
+
+// Reload spawn markers when the selected zone changes
+createEffect(() => {
+  const z = getSelectedZone();
+  if (spawnAuto && z !== undefined) {
+    spawnAuto.load(z);
+  }
+});
+
+// CLEANUP (DESTROY EVERYTHING WHEN COMPONENT UNMOUNTS)
+onCleanup(() => {
+  window.removeEventListener("resize", resizeCanvas);
+  cleanupNode(scene());
+  if (controls()) {
+    controls().dispose();
+    setControls(undefined);
+  }
+  spawnAuto?.destroy();
+  scene().clear();
+  camera().clear();
+});
 
   const clock = new THREE.Clock();
   const stats = new Stats();

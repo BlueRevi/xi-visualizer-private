@@ -141,3 +141,14 @@ export function addCustomCameraControls(camera: THREE.PerspectiveCamera | THREE.
 
   return controls;
 }
+
+// --- DEBUG EXPORT FOR OVERLAYS (read-only) ---
+// This file imports THREE, so we can safely expose it now.
+// scene/camera/renderer are not available in this file; those must be exported
+// where they are actually created (see Section B).
+Object.defineProperty(globalThis as any, "THREE", {
+  value: THREE,
+  writable: false,
+});
+console.log("[xi-visualizer] Exposed THREE from camera utils");
+``

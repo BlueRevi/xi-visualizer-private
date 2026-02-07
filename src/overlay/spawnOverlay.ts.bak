@@ -1,0 +1,396 @@
+// src/overlay/spawnOverlay.ts
+import * as THREE from "three";
+
+export type SpawnRow = {
+  id: number;
+  group: number;
+  internal_name?: string;
+  name?: string;
+  family_id?: number;
+  min_level?: number;
+  max_level?: number;
+  x: number; y: number; z: number;
+  heading?: number;
+};
+
+type OverlayDeps = {
+  scene: THREE.Scene;
+  camera: THREE.PerspectiveCamera;
+  renderer: THREE.WebGLRenderer;
+};
+
+const GROUP_NAME  = "__xi_spawn_markers__";
+const PANEL_ID    = "__spawn_filter__";
+const TIP_ID      = "__spawn_tip__";
+const LEGEND_ID   = "__spawn_legend__";
+
+const RADIUS      = 0.85;
+const FLIP_Z      = false;   // flip to true only if your dots look mirrored
+const SHOW_LEGEND = true;
+
+function classifyType(p: SpawnRow): string {
+  const iname = (p.internal_name || "").trim();
+  const name  = (p.name || "").trim();
+
+  // Yagudo role: "Yagudo_Scribe" -> "Yagudo Scribe"
+  if (/^Yagudo_/i.test(iname)) {
+    const role = iname.split("_").slice(1).join("_");
+    return ("Yagudo " + role.replace(/_/g, " ")).trim();
+  }
+  if (/^Yagudo\s/i.test(name)) return name;
+
+  // “Yagudo's Elemental”
+  if (/^Yagudo'?s Elemental$/i.test(name) || /^Yagudo'?s_Elemental$/i.test(iname)) {
+    return "Elemental (Yagudo)";
+  }
+
+  // Non‑Yagudo buckets
+  const s = (iname || name).toLowerCase();
+  if (s.includes("giant_pugil") || s.includes("giant pugil")) return "Giant Pugil";
+  if (s.includes("pugil")) return "Pugil";
+  if (s.includes("bee")) return "Bee";
+  if (s.includes("wasp")) return "Wasp";
+  if (s.includes("earth_eater") || s.includes("earth eater")) return "Earth Eater";
+  if (s.includes("dirt_eater")  || s.includes("dirt eater"))  return "Dirt Eater";
+  if (s.includes("elemental")) return "Elemental";
+
+  const base = iname.split("_")[0];
+  return base || name || "Unknown";
+}
+
+const fixedPalette: Record<string, number> = {
+  // Yagudo roles
+  "Yagudo Initiate":    0xF06292,
+  "Yagudo Acolyte":     0xFF8A65,
+  "Yagudo Scribe":      0xFFD54F,
+  "Yagudo Mendicant":   0x81C784,
+  "Yagudo Piper":       0x64B5F6,
+  "Yagudo Persecutor":  0x4FC3F7,
+  "Yagudo Votary":      0xBA68C8,
+  "Yagudo Theologist":  0x9575CD,
+  "Yagudo Priest":      0xB39DDB,
+  "Elemental (Yagudo)": 0x9B59B6,
+
+  // Non‑Yagudo
+  "Bee":         0xF1C40F,
+  "Wasp":        0xF39C12,
+  "Pugil":       0x3498DB,
+  "Giant Pugil": 0x2980B9,
+  "Earth Eater": 0x27AE60,
+  "Dirt Eater":  0x16A085,
+  "Elemental":   0x9B59B6,
+};
+
+function hashColor(label: string): number {
+  let h = 0;
+  for (let i = 0; i < label.length; i++) h = (h * 31 + label.charCodeAt(i)) | 0;
+  const hue = Math.abs(h) % 360;
+  const c = new THREE.Color();
+  c.setHSL(hue / 360, 0.62, 0.5);
+  return c.getHex();
+}
+
+export class SpawnOverlay {
+  private deps: OverlayDeps;
+  private group?: THREE.Group;
+  private materials = new Map<string, THREE.MeshBasicMaterial>();
+  private counts = new Map<string, number>();
+  private panelEl?: HTMLElement;
+  private tipEl?: HTMLDivElement;
+  private legendEl?: HTMLDivElement;
+  private ray = new THREE.Raycaster();
+  private mouse = new THREE.Vector2();
+
+  constructor(deps: OverlayDeps) {
+    this.deps = deps;
+  }
+
+  private matFor(t: string) {
+    if (this.materials.has(t)) return this.materials.get(t)!;
+    const hex = fixedPalette[t] ?? hashColor(t);
+    const m = new THREE.MeshBasicMaterial({ color: hex });
+    this.materials.set(t, m);
+    return m;
+  }
+
+  async load(zoneId: number) {
+    // Clean any previous
+    this.destroy();
+
+    // Fetch spawns/<zoneId>.json; if missing, do nothing
+    const url = `spawns/${zoneId}.json`;
+    let spawns: SpawnRow[] = [];
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return;
+      spawns = await res.json();
+    } catch {
+      return;
+    }
+    if (!spawns.length) return;
+
+    // Build markers
+    const { scene } = this.deps;
+    const geo = new THREE.SphereGeometry(RADIUS, 12, 12);
+    const group = new THREE.Group();
+    group.name = GROUP_NAME;
+    scene.add(group);
+    this.group = group;
+
+    this.counts.clear();
+    for (const p of spawns) {
+      const type = classifyType(p);
+      const mesh = new THREE.Mesh(geo, this.matFor(type));
+      mesh.position.set(p.x, p.y, FLIP_Z ? -p.z : p.z);
+      (mesh as any).userData = { ...p, type };
+      group.add(mesh);
+      this.counts.set(type, (this.counts.get(type) || 0) + 1);
+    }
+
+    this.installTooltip();
+    this.buildFilterPanel();
+    this.applyFilters();
+    this.buildLegend();
+  }
+
+  destroy() {
+    const { scene, renderer } = this.deps;
+    if (this.group) { scene.remove(this.group); this.group.clear(); this.group = undefined; }
+    if (this.panelEl) { this.panelEl.remove(); this.panelEl = undefined; }
+    if (this.tipEl)   { this.tipEl.remove();   this.tipEl   = undefined; }
+    if (this.legendEl){ this.legendEl.remove();this.legendEl = undefined; }
+    renderer.domElement.removeEventListener("mousemove", this.onMouseMove);
+  }
+
+  // ---------- Tooltip ----------
+  private onMouseMove = (e: MouseEvent) => {
+    if (!this.group || !this.tipEl) return;
+
+    const { renderer, camera } = this.deps;
+    const rect = renderer.domElement.getBoundingClientRect();
+
+    this.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    this.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+    this.ray.setFromCamera(this.mouse, camera);
+    const hits = this.ray.intersectObjects(this.group.children, false);
+
+    if (!hits.length) {
+      this.tipEl.style.display = "none";
+      return;
+    }
+
+    const d: any = hits[0].object.userData || {};
+
+    // position + show
+    this.tipEl.style.display = "block";
+    this.tipEl.style.left = (e.clientX + 12) + "px";
+    this.tipEl.style.top  = (e.clientY - 12) + "px";
+
+    // Build tooltip HTML with concatenation (no template strings)
+    const line1 = '<b style="font-weight:700">' + (d.name || d.internal_name || "Unknown") + '</b>';
+    const line2 = '<div style="opacity:.85">' + (d.type || "") + '</div>';
+    const line3 = '<div>ID: ' + d.id + ' | Group: ' + d.group + ' | Family: ' + d.family_id + '</div>';
+    const minLv = (d.min_level !== undefined ? d.min_level : "?");
+    const maxLv = (d.max_level !== undefined ? d.max_level : "?");
+    const line4 = '<div>Lv ' + minLv + ' – ' + maxLv + '</div>';
+    const line5 = '<div>XYZ: ' + Number(d.x).toFixed(1) + ', ' + Number(d.y).toFixed(1) + ', ' + Number(d.z).toFixed(1) + '</div>';
+
+    this.tipEl.innerHTML = line1 + line2 + line3 + line4 + line5;
+  };
+
+  private installTooltip() {
+    const { renderer } = this.deps;
+
+    const tip = document.createElement("div");
+    tip.id = TIP_ID;
+    tip.style.cssText = [
+      "position:fixed",
+      "z-index:999999",
+      "pointer-events:none",
+      "display:none",
+      "min-width:220px",
+      "max-width:320px",
+      "background:rgba(0,0,0,.78)",
+      "color:#fff",
+      "padding:6px 8px",
+      "border-radius:6px",
+      "font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
+      "box-shadow:0 2px 8px rgba(0,0,0,.35)",
+      "white-space:normal"
+    ].join(";");
+
+    document.body.appendChild(tip);
+    this.tipEl = tip;
+
+    renderer.domElement.addEventListener("mousemove", this.onMouseMove);
+  }
+
+  // ---------- Filtering helpers ----------
+  private selectedTypes(): Set<string> {
+    const sel = document.querySelector("#" + PANEL_ID + " select") as HTMLSelectElement | null;
+    const out = new Set<string>();
+    if (!sel) return out;
+    [...sel.options].forEach(o => { if (o.selected) out.add(o.value); });
+    return out;
+  }
+
+  private nameQuery(): string {
+    const input = document.querySelector("#" + PANEL_ID + " input[type='text']") as HTMLInputElement | null;
+    return (input?.value || "").trim().toLowerCase();
+  }
+
+  // ---------- Apply filters ----------
+  private applyFilters = () => {
+    if (!this.group) return;
+    const sel = this.selectedTypes();
+    const q = this.nameQuery();
+    const visibleCounts = new Map<string, number>();
+
+    for (const ch of this.group.children as THREE.Object3D[]) {
+      const d: any = (ch as any).userData || {};
+      let vis = sel.size === 0 || sel.has(d.type);
+      if (q) {
+        const label = (d.name || d.internal_name || "").toLowerCase();
+        vis = vis && label.includes(q);
+      }
+      (ch as any).visible = vis;
+      if (vis) visibleCounts.set(d.type, (visibleCounts.get(d.type) || 0) + 1);
+    }
+
+    this.buildLegend(visibleCounts);
+  };
+
+  // ---------- Legend ----------
+  private buildLegend(visibleCounts?: Map<string, number>) {
+    if (!SHOW_LEGEND) return;
+    if (this.legendEl) this.legendEl.remove();
+
+    const div = document.createElement("div");
+    div.id = LEGEND_ID;
+    div.style.cssText = [
+      "position:fixed",
+      "right:10px",
+      "top:10px",
+      "z-index:999998",
+      "max-height:50vh",
+      "overflow:auto",
+      "background:rgba(0,0,0,.55)",
+      "backdrop-filter:blur(3px)",
+      "color:#fff",
+      "padding:8px 10px",
+      "border-radius:8px",
+      "font:12px/1.35 system-ui,Segoe UI,Roboto,Helvetica,Arial",
+      "box-shadow:0 2px 8px rgba(0,0,0,.35)"
+    ].join(";");
+
+    const types = [...this.counts.keys()].sort((a, b) => a.localeCompare(b));
+    const rows = types.map(t => {
+      const hex = (fixedPalette[t] ?? hashColor(t)).toString(16).padStart(6, "0");
+      const total = this.counts.get(t) || 0;
+      const vis = visibleCounts?.get(t) ?? total;
+      return (
+        '<div style="display:flex;align-items:center;gap:8px;margin:2px 0">' +
+          '<span style="width:14px;height:14px;border-radius:3px;background:#' + hex + ';display:inline-block;border:1px solid rgba(255,255,255,.35)"></span>' +
+          '<span style="font-weight:600">' + t + '</span>' +
+          '<span style="opacity:.8;margin-left:auto">' + vis + '/' + total + '</span>' +
+        '</div>'
+      );
+    }).join("");
+
+    div.innerHTML = '<div style="font-weight:700;margin-bottom:6px">Spawn Types</div>' + rows;
+    document.body.appendChild(div);
+    this.legendEl = div;
+  }
+
+  // ---------- Filter panel ----------
+  private buildFilterPanel() {
+    if (this.panelEl) this.panelEl.remove();
+
+    const panel = document.createElement("div");
+    panel.id = PANEL_ID;
+    panel.style.cssText = [
+      "position:fixed",
+      "left:10px",
+      "top:10px",
+      "z-index:999999",
+      "background:rgba(0,0,0,.65)",
+      "color:#fff",
+      "padding:10px",
+      "border-radius:8px",
+      "font:12px/1.35 system-ui,Segoe UI,Roboto,Helvetica,Arial",
+      "box-shadow:0 2px 8px rgba(0,0,0,.35)",
+      "min-width:280px",
+      "max-width:360px"
+    ].join(";");
+    panel.innerHTML = '<div style="font-weight:700;margin-bottom:4px">Spawn Filter</div>';
+
+    const types = [...this.counts.keys()].sort((a, b) => a.localeCompare(b));
+    const sel = document.createElement("select");
+    sel.multiple = true;
+    sel.size = Math.min(14, Math.max(8, types.length));
+    sel.style.cssText = "width:100%;margin-top:6px;margin-bottom:8px;background:#111;color:#fff;border:1px solid #555;border-radius:4px;padding:4px";
+
+    types.forEach(t => {
+      const opt = document.createElement("option");
+      opt.value = t;
+      opt.textContent = t + " (" + (this.counts.get(t) || 0) + ")";
+      const hex = (fixedPalette[t] ?? hashColor(t)).toString(16).padStart(6, "0");
+      opt.style.background = "linear-gradient(90deg,#" + hex + "55 0 18px, transparent 18px)";
+      opt.selected = true;
+      sel.appendChild(opt);
+    });
+
+    const search = document.createElement("input");
+    search.type = "text";
+    search.placeholder = "Name contains…";
+    search.style.cssText = "width:100%;margin:6px 0;background:#111;color:#fff;border:1px solid #555;border-radius:4px;padding:4px";
+
+    const btnBar = document.createElement("div");
+    btnBar.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-top:4px";
+
+    const mkBtn = (text: string, onClick: () => void) => {
+      const b = document.createElement("button");
+      b.textContent = text;
+      b.style.cssText = "background:#2d6cdf;color:#fff;border:0;border-radius:4px;padding:4px 8px;cursor:pointer";
+      b.onclick = onClick;
+      return b;
+    };
+
+    const btnAll    = mkBtn("All",   () => { [...sel.options].forEach(o => (o.selected = true));  this.applyFilters(); });
+    const btnNone   = mkBtn("None",  () => { [...sel.options].forEach(o => (o.selected = false)); this.applyFilters(); });
+    const btnInvert = mkBtn("Invert",() => { [...sel.options].forEach(o => (o.selected = !o.selected)); this.applyFilters(); });
+    const btnFocus  = mkBtn("Re‑frame", () => this.focusVisible());
+
+    btnBar.append(btnAll, btnNone, btnInvert, btnFocus);
+
+    panel.appendChild(sel);
+    panel.appendChild(search);
+    panel.appendChild(btnBar);
+    document.body.appendChild(panel);
+    this.panelEl = panel;
+
+    sel.addEventListener("change", this.applyFilters);
+    search.addEventListener("input", this.applyFilters);
+  }
+
+  // ---------- Camera focus on visible markers ----------
+  private focusVisible() {
+    if (!this.group) return;
+
+    const tmp = new THREE.Group();
+    this.group.children.forEach(ch => { if ((ch as any).visible) tmp.add(ch.clone()); });
+    if (tmp.children.length === 0) return;
+
+    const box = new THREE.Box3().setFromObject(tmp);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const fov = this.deps.camera.fov * (Math.PI / 180);
+    const dist = Math.abs(maxDim / 2 / Math.tan(fov / 2)) * 1.2;
+    const dir = new THREE.Vector3();
+    this.deps.camera.getWorldDirection(dir);
+    this.deps.camera.position.copy(center).addScaledVector(dir, -dist);
+    this.deps.camera.lookAt(center);
+  }
+} // <-- IMPORTANT: closes the class
