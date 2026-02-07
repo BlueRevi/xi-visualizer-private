@@ -20,11 +20,29 @@ type Deps = {
 };
 
 const GROUP_NAME = "__xi_spawn_markers__";
-const RADIUS = 1.7;
+const RADIUS = 1.7; // geometry is created at this radius (used as "Large" preset)
 const FLIP_Z = false; // set true only if dots look mirrored
 const TIP_ID = "__spawn_tip__";
 
-// Derive a readable "type" (splits Yagudo by role and normalizes some families)
+// ---- Size presets (world radius) ----
+const SIZE_PRESETS = {
+  small: 0.85,
+  medium: 1.2,
+  large: 1.7,
+} as const;
+type SizeKey = keyof typeof SIZE_PRESETS;
+
+// ---- Screen-space pixel targets per preset (used when Auto-scale is ON) ----
+const PRESET_PIXEL_TARGET: Record<SizeKey, number> = {
+  small: 8,     // ~8px visual radius
+  medium: 12,   // ~12px
+  large: 16,    // ~16px
+};
+
+// ---- Outline ----
+const OUTLINE_SCALE = 1.12; // outline mesh scale factor (~8% larger than the dot)
+
+/* Derive a readable "type" (splits Yagudo by role and normalizes some families) */
 function mobType(p: SpawnRow): string {
   const iname = (p.internal_name || "").trim();
   const name  = (p.name || "").trim();
@@ -51,10 +69,15 @@ function mobType(p: SpawnRow): string {
   return base || name || "Unknown";
 }
 
+/**
+ * Stable color per label.
+ * NOTE: If colors look too dark, bump lightness from 0.10 -> ~0.60
+ * e.g. c.setHSL(hue/360, 0.95, 0.60)
+ */
 function hashColor(label: string): number {
   let h = 0; for (let i = 0; i < label.length; i++) h = (h*31 + label.charCodeAt(i)) | 0;
   const hue = Math.abs(h) % 360;
-  const c = new THREE.Color(); c.setHSL(hue/360, 0.95, 0.1);
+  const c = new THREE.Color(); c.setHSL(hue/360, 0.95, 0.10);
   return c.getHex();
 }
 
@@ -74,6 +97,14 @@ export class SpawnAutoload {
   private tipEl?: HTMLDivElement;
   private ray = new THREE.Raycaster();
   private mouse = new THREE.Vector2();
+
+  // ---- Size + Auto-scale state ----
+  private currentSize: SizeKey = "large"; // default base size preset
+  private autoScaleEnabled = false;       // OFF by default (you said presets feel good)
+  private rafId?: number;                 // requestAnimationFrame handle for loop
+
+  // ---- Outline material (shared) ----
+  private outlineMat?: THREE.MeshBasicMaterial;
 
   constructor(deps: Deps) {
     this.deps = deps;
@@ -148,10 +179,20 @@ export class SpawnAutoload {
     for (const p of spawns) {
       const t  = mobType(p);
       const m  = this.matFor(t);
+
+      // Base dot mesh
       const s  = new THREE.Mesh(geo, m);
+
+      // Add a thin black outline (scaled backface mesh)
+      const outline = new THREE.Mesh(geo, this.getOutlineMaterial());
+      outline.scale.setScalar(OUTLINE_SCALE);
+      s.add(outline);
+
+      // Position + userData
       const X  = p.x, Y = p.y, Z = FLIP_Z ? -p.z : p.z;
       s.position.set(X, Y, Z);
       (s as any).userData = { ...p, type: t };
+
       group.add(s);
 
       this.types.set(t, (this.types.get(t) || 0) + 1);
@@ -252,9 +293,23 @@ export class SpawnAutoload {
     // ---------- UI panel + tooltip ----------
     this.buildFilterPanel();   // builds panel, defaults all unchecked, calls applyPanelFilters()
     this.installTooltip();     // hover info
+
+    // ---------- Initialize sizes / loop ----------
+    if (this.autoScaleEnabled) {
+      this.updateAutoScaleOnce(); // compute initial screen-space sizes
+      this.startAutoScaleLoop();
+    } else {
+      this.applyFixedScale();     // snap to preset base
+    }
   }
 
   destroy() {
+    // cancel auto-scale loop
+    if (this.rafId !== undefined) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = undefined;
+    }
+
     // remove the filter panel first
     if (this.panelEl) { this.panelEl.remove(); this.panelEl = undefined; }
 
@@ -276,6 +331,20 @@ export class SpawnAutoload {
     this.mats.set(t, m); return m;
   }
 
+  private getOutlineMaterial(): THREE.MeshBasicMaterial {
+    if (!this.outlineMat) {
+      this.outlineMat = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        side: THREE.BackSide,    // backfaces form a silhouette when slightly scaled up
+        transparent: true,
+        opacity: 0.9,            // crisp, thin outline
+        depthWrite: false,       // don't affect depth buffer
+        toneMapped: false,
+      });
+    }
+    return this.outlineMat;
+  }
+
   private setVisibleBy(fn: (ud: unknown) => boolean, forceShowGroup?: boolean) {
     if (!this.group) return;
     let any = false;
@@ -287,6 +356,13 @@ export class SpawnAutoload {
     }
     // If caller explicitly wants to surface the layer, honor it; else auto-toggle by result
     this.group.visible = !!(forceShowGroup ? true : any);
+
+    // Keep sizes consistent when toggling visibility
+    if (!this.autoScaleEnabled) {
+      this.applyFixedScale();
+    } else {
+      this.updateAutoScaleOnce();
+    }
   }
 
   private countVisible() {
@@ -312,7 +388,7 @@ export class SpawnAutoload {
     this.deps.camera.lookAt(center);
   }
 
-  /** Build / rebuild the floating filter panel (checkbox list + search). */
+  /** Build / rebuild the floating filter panel (checkbox list + search + size + autoscale). */
   private buildFilterPanel() {
     // Remove any previous panel
     const old = document.getElementById(this.PANEL_ID);
@@ -376,10 +452,79 @@ export class SpawnAutoload {
     search.style.cssText = "width:100%;margin:6px 0;background:#111;color:#fff;border:1px solid #555;border-radius:4px;padding:4px";
     search.addEventListener("input", () => this.applyPanelFilters());
 
+    // 2.5) Size preset radios
+    const sizeWrap = document.createElement("div");
+    sizeWrap.style.cssText = "display:flex;flex-direction:column;gap:6px;margin:6px 0 4px 0";
+
+    const sizeTitle = document.createElement("div");
+    sizeTitle.textContent = "Marker size";
+    sizeTitle.style.cssText = "opacity:.9;font-weight:600";
+
+    const sizeRow = document.createElement("div");
+    sizeRow.style.cssText = "display:flex;gap:10px;flex-wrap:wrap";
+
+    const mkSizeRadio = (key: SizeKey, label: string) => {
+      const wrap = document.createElement("label");
+      wrap.style.cssText = "display:flex;align-items:center;gap:6px;cursor:pointer";
+
+      const input = document.createElement("input");
+      input.type = "radio";
+      input.name = "__spawn_size";
+      input.value = key;
+      input.checked = (this.currentSize === key);
+      input.addEventListener("change", () => {
+        if (input.checked) {
+          this.currentSize = key as SizeKey;
+          if (this.autoScaleEnabled) {
+            this.updateAutoScaleOnce(); // recompute based on new pixel target
+          } else {
+            this.applyFixedScale();     // snap to preset base size
+          }
+        }
+      });
+
+      const text = document.createElement("span");
+      text.textContent = label;
+
+      wrap.appendChild(input);
+      wrap.appendChild(text);
+      return wrap;
+    };
+
+    sizeRow.appendChild(mkSizeRadio("small",  "Small"));
+    sizeRow.appendChild(mkSizeRadio("medium", "Medium"));
+    sizeRow.appendChild(mkSizeRadio("large",  "Large"));
+
+    sizeWrap.appendChild(sizeTitle);
+    sizeWrap.appendChild(sizeRow);
+
+    // 2.6) Auto scale toggle (screen-space)
+    const autoWrap = document.createElement("label");
+    autoWrap.style.cssText = "display:flex;align-items:center;gap:8px;margin:4px 0;cursor:pointer";
+
+    const autoCb = document.createElement("input");
+    autoCb.type = "checkbox";
+    autoCb.checked = this.autoScaleEnabled;
+    autoCb.addEventListener("change", () => {
+      this.autoScaleEnabled = autoCb.checked;
+      if (this.autoScaleEnabled) {
+        this.updateAutoScaleOnce();
+        this.startAutoScaleLoop();
+      } else {
+        this.applyFixedScale();
+      }
+    });
+
+    const autoLbl = document.createElement("span");
+    autoLbl.textContent = "Auto scale with zoom";
+
+    autoWrap.appendChild(autoCb);
+    autoWrap.appendChild(autoLbl);
+
     // 3) Buttons: All / None / Re‑frame
     const btnBar = document.createElement("div");
     btnBar.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-top:4px";
-    const mkBtn = (text: string, onClick: ()=>void) => {
+    const mkBtn = (text: string, onClick: () => void) => {
       const b = document.createElement("button");
       b.textContent = text;
       b.style.cssText = "background:#2d6cdf;color:#fff;border:0;border-radius:4px;padding:4px 8px;cursor:pointer";
@@ -401,6 +546,8 @@ export class SpawnAutoload {
 
     panel.appendChild(list);
     panel.appendChild(search);
+    panel.appendChild(sizeWrap);
+    panel.appendChild(autoWrap);
     panel.appendChild(btnBar);
     document.body.appendChild(panel);
 
@@ -450,6 +597,76 @@ export class SpawnAutoload {
 
       (ch as any).visible = vis;
     }
+
+    // Keep sizes consistent as visibility changes
+    if (!this.autoScaleEnabled) {
+      this.applyFixedScale();
+    } else {
+      this.updateAutoScaleOnce();
+    }
+  }
+
+  // ---------- Size logic ----------
+  /** Base scale derived from preset and geometry radius (used when auto-scale is OFF). */
+  private getBaseScale(): number {
+    // geometry created at RADIUS; preset is desired world radius
+    return SIZE_PRESETS[this.currentSize] / RADIUS;
+    // e.g., Large => 1.7/1.7 = 1.0; Small => 0.85/1.7 = 0.5; Medium => 1.2/1.7 ≈ 0.706
+  }
+
+  /** When auto-scale is off, normalize all markers to base preset size. */
+  private applyFixedScale() {
+    if (!this.group) return;
+    const base = this.getBaseScale();
+    for (const ch of this.group.children) {
+      (ch as THREE.Mesh).scale.setScalar(base);
+    }
+  }
+
+  // ---------- Screen-space auto-scale logic ----------
+  /**
+   * Compute a scale factor so the sphere projects to ~targetPx radius on screen.
+   * Uses perspective projection math: world_radius = px * depth * 2*tan(fov/2) / canvas_height
+   */
+  private scaleForScreenPixels(targetPx: number, worldPos: THREE.Vector3): number {
+    const { camera, renderer } = this.deps;
+    const canvas = renderer.domElement;
+    const height = canvas.clientHeight || canvas.height || canvas.getBoundingClientRect().height || 1;
+
+    // distance from camera to object in world space
+    const d = camera.position.distanceTo(worldPos);
+
+    // For PerspectiveCamera (as typed in Deps)
+    const fov = camera.fov * (Math.PI / 180);
+    const worldRadius = (targetPx * d * 2 * Math.tan(fov / 2)) / height;
+
+    // geometry radius is RADIUS -> scale so mesh radius becomes worldRadius
+    return Math.max(1e-4, worldRadius / RADIUS);
+  }
+
+  /** Rescales **visible** markers to target a pixel radius based on current preset. */
+  private updateAutoScaleOnce() {
+    if (!this.group || !this.group.visible) return;
+
+    const targetPx = PRESET_PIXEL_TARGET[this.currentSize];
+    const tmp = new THREE.Vector3();
+
+    for (const ch of this.group.children) {
+      if (!(ch as any).visible) continue;
+      const worldPos = (ch as THREE.Mesh).getWorldPosition(tmp);
+      const s = this.scaleForScreenPixels(targetPx, worldPos);
+      (ch as THREE.Mesh).scale.setScalar(s);
+    }
+  }
+
+  /** Starts a RAF loop that updates marker scales every frame (when auto-scale is ON). */
+  private startAutoScaleLoop() {
+    if (this.rafId !== undefined) return; // already running
+    const tick = () => {
+      if (this.autoScaleEnabled) this.updateAutoScaleOnce();
+      this.rafId = requestAnimationFrame(tick);
+    };
+    this.rafId = requestAnimationFrame(tick);
   }
 
   // ---------- Tooltip ----------
