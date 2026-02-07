@@ -35,45 +35,14 @@ type SizeKey = keyof typeof SIZE_PRESETS;
 // ---- Screen-space pixel targets per preset (used when Auto-scale is ON) ----
 const PRESET_PIXEL_TARGET: Record<SizeKey, number> = {
   small: 6,     // ~8px visual radius
-  medium: 9,   // ~12px
+  medium: 9,    // ~12px
   large: 12,    // ~16px
 };
 
 // ---- Outline ----
 const OUTLINE_SCALE = 1.12; // outline mesh scale factor (~8% larger than the dot)
 
-/* Derive a readable "type" (splits Yagudo by role and normalizes some families) */
-function mobType(p: SpawnRow): string {
-  const iname = (p.internal_name || "").trim();
-  const name  = (p.name || "").trim();
-
-  if (/^Yagudo_/i.test(iname)) {
-    const role = iname.split("_").slice(1).join("_").replace(/_/g, " ");
-    return ("Yagudo " + role).trim();
-  }
-  if (/^Yagudo\s/i.test(name)) return name;
-
-  if (/^Yagudo'?s Elemental$/i.test(name) || /^Yagudo'?s_Elemental$/i.test(iname))
-    return "Elemental (Yagudo)";
-
-  const s = (iname || name).toLowerCase();
-  if (s.includes("giant_pugil") || s.includes("giant pugil")) return "Giant Pugil";
-  if (s.includes("pugil")) return "Pugil";
-  if (s.includes("bee")) return "Bee";
-  if (s.includes("wasp")) return "Wasp";
-  if (s.includes("earth_eater") || s.includes("earth eater")) return "Earth Eater";
-  if (s.includes("dirt_eater")  || s.includes("dirt eater"))  return "Dirt Eater";
-  if (s.includes("elemental")) return "Elemental";
-
-  const base = iname.split("_")[0];
-  return base || name || "Unknown";
-}
-
-/**
- * Stable color per label.
- * NOTE: If colors look too dark, bump lightness from 0.10 -> ~0.60
- * e.g. c.setHSL(hue/360, 0.95, 0.60)
- */
+/** Stable color per label (we’ll use exact display name so identical names share color). */
 function hashColor(label: string): number {
   let h = 0; for (let i = 0; i < label.length; i++) h = (h*31 + label.charCodeAt(i)) | 0;
   const hue = Math.abs(h) % 360;
@@ -85,7 +54,9 @@ export class SpawnAutoload {
   private deps: Deps;
   private group?: THREE.Group;
   private rows: SpawnRow[] = [];
-  private types = new Map<string, number>();        // type -> count
+
+  // Exact-name -> count
+  private nameCounts = new Map<string, number>();
   private families = new Map<number, number>();     // family_id -> count
   private mats  = new Map<string, THREE.MeshBasicMaterial>();
 
@@ -168,7 +139,7 @@ export class SpawnAutoload {
 
     // ---------- Build markers ----------
     this.rows = spawns;
-    this.types.clear();
+    this.nameCounts.clear();
     this.families.clear();
 
     const geo = new THREE.SphereGeometry(RADIUS, 12, 12);
@@ -177,31 +148,34 @@ export class SpawnAutoload {
     this.group = group;
 
     for (const p of spawns) {
-      const t  = mobType(p);
-      const m  = this.matFor(t);
+      // EXACT display name as provided by your data. No normalization or shortening.
+      const displayName = p.name ?? p.internal_name ?? "Unknown";
 
-      // Base dot mesh
-      const s  = new THREE.Mesh(geo, m);
+      // Base dot mesh using a color keyed by exact name (consistent per name)
+      const m = this.matFor(displayName);
+      const s = new THREE.Mesh(geo, m);
 
       // Add a thin black outline (scaled backface mesh)
       const outline = new THREE.Mesh(geo, this.getOutlineMaterial());
       outline.scale.setScalar(OUTLINE_SCALE);
       s.add(outline);
 
-      // Position + userData
+      // Position + userData (store exact displayName for UI/tooltip/filter)
       const X  = p.x, Y = p.y, Z = FLIP_Z ? -p.z : p.z;
       s.position.set(X, Y, Z);
-      (s as any).userData = { ...p, type: t };
+      (s as any).userData = { ...p, displayName };
 
       group.add(s);
 
-      this.types.set(t, (this.types.get(t) || 0) + 1);
+      // Count by exact displayName for the panel
+      this.nameCounts.set(displayName, (this.nameCounts.get(displayName) || 0) + 1);
+
       if (typeof p.family_id === "number") {
         this.families.set(p.family_id, (this.families.get(p.family_id) || 0) + 1);
       }
     }
 
-    // Start hidden by default (no dots until user selects types)
+    // Start hidden by default (no dots until user selects names)
     this.group.visible = false;
 
     // ---------- Console API ----------
@@ -209,17 +183,17 @@ export class SpawnAutoload {
       baseUrl : base,
       group   : this.group,
       rows    : this.rows,
-      types   : new Map(this.types),
+      names   : new Map(this.nameCounts), // exact name -> count
       families: new Map(this.families),
 
       // ---- filtering helpers ----
       showAll : () => this.setVisibleBy(() => true, /*forceShowGroup*/true),
       hideAll : () => { if (this.group) { this.group.visible = false; this.setVisibleBy(() => false); } },
 
-      /** Show only these types (string or array). */
-      onlyTypes: (t: string | string[]) => {
-        const set = new Set(Array.isArray(t) ? t : [t]);
-        this.setVisibleBy(d => set.has((d as any).type), /*forceShowGroup*/true);
+      /** Show only these exact names (string or array). */
+      onlyNames: (n: string | string[]) => {
+        const set = new Set(Array.isArray(n) ? n : [n]);
+        this.setVisibleBy(d => set.has((d as any).displayName), /*forceShowGroup*/true);
       },
 
       /** Show only these family IDs (number or array). */
@@ -237,36 +211,36 @@ export class SpawnAutoload {
         }, /*forceShowGroup*/true);
       },
 
-      /** Name contains substring (case-insensitive). */
+      /** Name contains substring (case-insensitive), against exact strings. */
       nameContains: (q: string) => {
         const ql = q.toLowerCase();
         this.setVisibleBy(d => {
-          const nm = ((d as any).name || (d as any).internal_name || "").toLowerCase();
+          const nm = String((d as any).name ?? (d as any).internal_name ?? "").toLowerCase();
           return nm.includes(ql);
         }, /*forceShowGroup*/true);
       },
 
       /** Combined filter in one call. All criteria are ANDed. */
       filter: (opts: {
-        types?: string[];
+        names?: string[];       // exact names
         families?: number[];
-        name?: string;
+        name?: string;          // contains
         minLevel?: number;
         maxLevel?: number;
       }) => {
-        const ty = opts?.types ? new Set(opts.types) : undefined;
-        const fa = opts?.families ? new Set(opts.families) : undefined;
-        const ql = opts?.name ? opts.name.toLowerCase() : undefined;
-        const lvMin = opts?.minLevel;
-        const lvMax = opts?.maxLevel;
+        const nameSet = opts?.names ? new Set(opts.names) : undefined;
+        const famSet  = opts?.families ? new Set(opts.families) : undefined;
+        const ql      = opts?.name ? opts.name.toLowerCase() : undefined;
+        const lvMin   = opts?.minLevel;
+        const lvMax   = opts?.maxLevel;
 
         this.setVisibleBy(d => {
           const dd: any = d;
-          if (ty && !ty.has(dd.type)) return false;
-          if (fa && !fa.has(dd.family_id)) return false;
+          if (nameSet && !nameSet.has(dd.displayName)) return false;
+          if (famSet  && !famSet.has(dd.family_id))    return false;
 
           if (ql) {
-            const nm = (dd.name || dd.internal_name || "").toLowerCase();
+            const nm = String(dd.name ?? dd.internal_name ?? "").toLowerCase();
             if (!nm.includes(ql)) return false;
           }
 
@@ -416,28 +390,29 @@ export class SpawnAutoload {
     ].join(";");
     panel.innerHTML = '<div style="font-weight:700;margin-bottom:6px">Spawn Filter</div>';
 
-    // 1) Checkboxes (one per type)
+    // 1) Checkboxes (one per exact name)
     const list = document.createElement("div");
     list.style.cssText = "display:flex;flex-direction:column;gap:4px;max-height:30vh;overflow:auto;margin-bottom:8px";
-    const types = [...this.types.keys()].sort((a,b)=>a.localeCompare(b));
+    const names = [...this.nameCounts.keys()].sort((a,b)=>a.localeCompare(b));
 
-    types.forEach(t => {
+    names.forEach(nm => {
       const row = document.createElement("label");
       row.style.cssText = "display:flex;align-items:center;gap:8px;cursor:pointer";
 
+      // Color swatch per exact name (stable)
       const sw = document.createElement("span");
-      const colorObj = this.mats.get(t)?.color;
+      const colorObj = this.mats.get(nm)?.color;
       const hex = (colorObj ? colorObj.getHexString() : "999999");
       sw.style.cssText = `width:14px;height:14px;border-radius:3px;border:1px solid rgba(255,255,255,.35);display:inline-block;background:#${hex}`;
 
       const cb = document.createElement("input");
       cb.type = "checkbox";
       cb.checked = false;              // default OFF (layer starts hidden)
-      cb.dataset["type"] = t;          // data-type="..."
+      cb.dataset["name"] = nm;         // data-name="exact mob name"
       cb.addEventListener("change", () => this.applyPanelFilters());
 
       const label = document.createElement("span");
-      label.textContent = `${t} (${this.types.get(t) || 0})`;
+      label.textContent = `${nm} (${this.nameCounts.get(nm) || 0})`;
 
       row.appendChild(sw);
       row.appendChild(cb);
@@ -445,7 +420,7 @@ export class SpawnAutoload {
       list.appendChild(row);
     });
 
-    // 2) Name search
+    // 2) Name search (doesn't mutate display names)
     const search = document.createElement("input");
     search.type = "text";
     search.placeholder = "Name contains…";
@@ -531,7 +506,7 @@ export class SpawnAutoload {
       b.onclick = onClick; return b;
     };
 
-    const SEL = 'input[type="checkbox"][data-type]';
+    const SEL = 'input[type="checkbox"][data-name]';
 
     const btnAll   = mkBtn("All",  () => {
       list.querySelectorAll<HTMLInputElement>(SEL).forEach(el => el.checked = true);
@@ -563,22 +538,22 @@ export class SpawnAutoload {
     const panel = this.panelEl ?? (document.getElementById(this.PANEL_ID) as HTMLDivElement | null);
     if (!panel) return;
 
-    const SEL = 'input[type="checkbox"][data-type]';
+    const SEL = 'input[type="checkbox"][data-name]';
 
     // Gather selection
     const boxes = panel.querySelectorAll<HTMLInputElement>(SEL);
-    const selected = new Set<string>();
-    boxes.forEach(el => { if (el.checked) selected.add(el.dataset.type!); });
+    const selectedNames = new Set<string>();
+    boxes.forEach(el => { if (el.checked) selectedNames.add(el.dataset.name!); });
 
     // 0 selected ⇒ group hidden (hard off); >0 ⇒ group visible
-    const allowAny = selected.size > 0;
+    const allowAny = selectedNames.size > 0;
     this.group.visible = allowAny;
 
-    // Name query (case-insensitive)
+    // Name query (case-insensitive) — works against exact strings; we don't change names
     const qInput = panel.querySelector<HTMLInputElement>("input[type='text']");
     const q = (qInput?.value || "").trim().toLowerCase();
 
-    // Apply to markers (only if we allow any types; otherwise all off)
+    // Apply to markers (only if we allow any names; otherwise all off)
     if (!allowAny) {
       for (const ch of this.group.children) (ch as any).visible = false;
       return;
@@ -586,13 +561,12 @@ export class SpawnAutoload {
 
     for (const ch of this.group.children) {
       const d: any = (ch as any).userData || {};
-      const ty = d.type as string | undefined;
+      const exactName: string = d.displayName || "Unknown";
 
-      let vis = !!ty && selected.has(ty);
+      let vis = selectedNames.has(exactName);
 
       if (q) {
-        const nm = (d.name || d.internal_name || "").toLowerCase();
-        vis = vis && nm.includes(q);
+        vis = vis && exactName.toLowerCase().includes(q);
       }
 
       (ch as any).visible = vis;
@@ -694,20 +668,19 @@ export class SpawnAutoload {
     this.tipEl.style.left = (e.clientX + 12) + "px";
     this.tipEl.style.top  = (e.clientY - 12) + "px";
 
-    // Build tooltip HTML without template strings (robust)
-    const line1 = '<b style="font-weight:700">' + (d.name || d.internal_name || "Unknown") + '</b>';
-    const line2 = '<div style="opacity:.85">' + (d.type || "") + '</div>';
+    // Build tooltip HTML using EXACT names (no normalization)
+    const line1 = '<b style="font-weight:700">' + (d.displayName || d.name || d.internal_name || "Unknown") + '</b>';
     const famSeg = (d.family_id !== undefined && d.family_id !== null) ? (' | Family: ' + d.family_id) : '';
-    const line3 = '<div>ID: ' + d.id + ' | Group: ' + d.group + famSeg + '</div>';
+    const line2 = '<div>ID: ' + d.id + ' | Group: ' + d.group + famSeg + '</div>';
     const minLv = (d.min_level !== undefined ? d.min_level : "?");
     const maxLv = (d.max_level !== undefined ? d.max_level : "?");
-    const line4 = '<div>Lv ' + minLv + ' – ' + maxLv + '</div>';
+    const line3 = '<div>Lv ' + minLv + ' – ' + maxLv + '</div>';
     const fx = Number(d.x), fy = Number(d.y), fz = Number(d.z);
-    const line5 = '<div>XYZ: ' + (isFinite(fx) ? fx.toFixed(1) : '?') + ', ' +
+    const line4 = '<div>XYZ: ' + (isFinite(fx) ? fx.toFixed(1) : '?') + ', ' +
                                  (isFinite(fy) ? fy.toFixed(1) : '?') + ', ' +
                                  (isFinite(fz) ? fz.toFixed(1) : '?') + '</div>';
 
-    this.tipEl.innerHTML = line1 + line2 + line3 + line4 + line5;
+    this.tipEl.innerHTML = line1 + line2 + line3 + line4;
   };
 
   private installTooltip() {
