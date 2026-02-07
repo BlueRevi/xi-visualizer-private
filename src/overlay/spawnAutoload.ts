@@ -34,9 +34,9 @@ type SizeKey = keyof typeof SIZE_PRESETS;
 
 // ---- Screen-space pixel targets per preset (used when Auto-scale is ON) ----
 const PRESET_PIXEL_TARGET: Record<SizeKey, number> = {
-  small: 8,     // ~8px visual radius
-  medium: 12,   // ~12px
-  large: 16,    // ~16px
+  small: 6,     // ~8px visual radius
+  medium: 9,   // ~12px
+  large: 12,    // ~16px
 };
 
 // ---- Outline ----
@@ -411,14 +411,14 @@ export class SpawnAutoload {
       "border-radius:8px",
       "font:12px/1.35 system-ui,Segoe UI,Roboto,Helvetica,Arial",
       "box-shadow:0 2px 8px rgba(0,0,0,.35)",
-      "min-width:280px",
+      "min-width:220px",
       "max-width:360px"
     ].join(";");
     panel.innerHTML = '<div style="font-weight:700;margin-bottom:6px">Spawn Filter</div>';
 
     // 1) Checkboxes (one per type)
     const list = document.createElement("div");
-    list.style.cssText = "display:flex;flex-direction:column;gap:4px;max-height:40vh;overflow:auto;margin-bottom:8px";
+    list.style.cssText = "display:flex;flex-direction:column;gap:4px;max-height:30vh;overflow:auto;margin-bottom:8px";
     const types = [...this.types.keys()].sort((a,b)=>a.localeCompare(b));
 
     types.forEach(t => {
