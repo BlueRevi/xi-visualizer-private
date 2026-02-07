@@ -20,7 +20,7 @@ type Deps = {
 };
 
 const GROUP_NAME = "__xi_spawn_markers__";
-const RADIUS = 0.85;
+const RADIUS = 1.7;
 const FLIP_Z = false; // set true only if dots look mirrored
 const TIP_ID = "__spawn_tip__";
 
@@ -54,7 +54,7 @@ function mobType(p: SpawnRow): string {
 function hashColor(label: string): number {
   let h = 0; for (let i = 0; i < label.length; i++) h = (h*31 + label.charCodeAt(i)) | 0;
   const hue = Math.abs(h) % 360;
-  const c = new THREE.Color(); c.setHSL(hue/360, 0.62, 0.5);
+  const c = new THREE.Color(); c.setHSL(hue/360, 0.95, 0.1);
   return c.getHex();
 }
 
@@ -272,7 +272,7 @@ export class SpawnAutoload {
   // ---- helpers ----
   private matFor(t: string) {
     if (this.mats.has(t)) return this.mats.get(t)!;
-    const m = new THREE.MeshBasicMaterial({ color: hashColor(t) });
+    const m = new THREE.MeshBasicMaterial({ color: hashColor(t), toneMapped: false });
     this.mats.set(t, m); return m;
   }
 
